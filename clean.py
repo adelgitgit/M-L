@@ -1,6 +1,8 @@
 """Data-cleaning helpers for tabular time-series data."""
 
-from collections.abc import Hashable
+from __future__ import annotations
+
+from collections.abc import Hashable, Iterable
 from numbers import Integral
 
 import numpy as np
@@ -67,7 +69,7 @@ class Cleaner:
         self,
         n_neighbors: int = 5,
         auto_impute: bool = True,
-        bad_row_indices: pd.Index | None = None,
+        bad_row_indices: pd.Index | Iterable | None = None,
         column: Hashable | None = None,
     ) -> pd.DataFrame:
         """Impute missing numeric values using good rows as KNN neighbors.
@@ -85,18 +87,28 @@ class Cleaner:
         n_neighbors = int(n_neighbors)
         if not isinstance(auto_impute, bool):
             raise TypeError("auto_impute must be a bool")
-        if bad_row_indices is not None and not isinstance(bad_row_indices, pd.Index):
-            raise TypeError("bad_row_indices must be a pandas Index or None")
+
         if bad_row_indices is not None:
+            if not isinstance(bad_row_indices, pd.Index):
+                try:
+                    bad_row_indices = pd.Index(bad_row_indices)
+                except Exception as error:
+                    raise TypeError("bad_row_indices must be a pandas Index or iterable of labels") from error
             unknown_indices = bad_row_indices[~bad_row_indices.isin(self.data.index)]
             if not unknown_indices.empty:
                 raise ValueError(
                     f"bad_row_indices contains labels not present in the data: "
                     f"{unknown_indices.tolist()!r}"
                 )
+
         if column is not None:
             if column not in self.data.columns:
-                raise KeyError(f"column {column!r} is not present in the data")
+                if str(column) in self.data.columns:
+                    column = str(column)
+                elif isinstance(column, str) and column.isdigit() and int(column) in self.data.columns:
+                    column = int(column)
+                else:
+                    raise KeyError(f"column {column!r} is not present in the data")
             if column not in self.data.select_dtypes(include="number").columns:
                 raise TypeError(f"column {column!r} must be numeric")
 
@@ -111,16 +123,22 @@ class Cleaner:
         numeric_data = result.loc[:, numeric_columns]
         if np.isinf(numeric_data.to_numpy(dtype=float, na_value=np.nan)).any():
             raise ValueError("numeric columns contain infinite values")
-        if not numeric_data.isna().any().any():
-            if column is None or bad_row_indices is None:
+
+        has_nans = numeric_data.isna().any().any()
+        if not has_nans:
+            if bad_row_indices is None or len(bad_row_indices) == 0:
                 return result
 
         if bad_row_indices is None:
-            bad_rows = numeric_data[column].isna().to_numpy()
+            if column is None:
+                bad_rows = numeric_data.isna().any(axis=1).to_numpy()
+            else:
+                bad_rows = numeric_data[column].isna().to_numpy()
         else:
             bad_rows = result.index.isin(bad_row_indices)
         good_rows = ~bad_rows
-        if column is None and not numeric_data.isna().any().any():
+
+        if column is None and not bad_rows.any() and not has_nans:
             return result
         if column is not None and not bad_rows.any():
             return result
@@ -145,15 +163,23 @@ class Cleaner:
         imputer = KNNImputer(n_neighbors=n_neighbors)
         imputer.fit(good_numeric_data.loc[:, columns_to_impute])
         query_data = numeric_data.loc[:, columns_to_impute].copy()
+
         if column is not None:
             column_position = columns_to_impute.get_loc(column)
             query_data.iloc[bad_rows, column_position] = np.nan
-            imputed = imputer.transform(query_data)
-            result.iloc[bad_rows, result.columns.get_loc(column)] = imputed[
-                bad_rows, column_position
-            ]
+            if bad_rows.any():
+                imputed = imputer.transform(query_data.iloc[bad_rows])
+                result.iloc[bad_rows, result.columns.get_loc(column)] = imputed[
+                    :, column_position
+                ]
         else:
-            imputed = imputer.transform(query_data)
-            result.loc[:, columns_to_impute] = imputed
+            if bad_row_indices is not None:
+                query_data.iloc[bad_rows, :] = np.nan
+            rows_to_impute = bad_rows | query_data.isna().any(axis=1).to_numpy()
+            if rows_to_impute.any():
+                imputed = imputer.transform(query_data.iloc[rows_to_impute])
+                col_locs = [result.columns.get_loc(c) for c in columns_to_impute]
+                result.iloc[rows_to_impute, col_locs] = imputed
+
         return result
 
